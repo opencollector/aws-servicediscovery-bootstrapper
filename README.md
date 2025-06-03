@@ -53,6 +53,19 @@ Valid values are:
 <dd>
 The number of times to retry service discovery if no instances that matches the specified health status are found. Default is `3`.
 </dd>
+<dt><code>-precondition</code></dt>
+<dd>
+
+A precondition to check before running the command. If the precondition is not met, the command will not be executed.
+
+Valid values are:
+- `AllEcsTasksRunning`: The command will only be executed if all ECS tasks in the cluster are running.
+</dd>
+<dt><code>-precondition-check-timeout</code></dt>
+<dd>
+
+The timeout for the precondition check. If the precondition check does not complete within the specified timeout, the command will not be executed. The timeout can be specified with a suffix of `s` (seconds), `ms` (milliseconds), `us` (microseconds), or `ns` (nanoseconds). Default is `30s`.
+</dd>
 <dt><code>-execution-delay-jitter</code></dt>
 <dd>
 

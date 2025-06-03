@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -21,6 +24,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
 	servicediscovery_types "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
 	"github.com/aws/smithy-go/middleware"
@@ -30,6 +34,8 @@ import (
 
 var namespace string
 var healthStatus string
+var precondition string
+var preconditionCheckTimeout time.Duration
 var retryCount int
 var noFail bool
 var executionDelayJitter time.Duration
@@ -38,6 +44,8 @@ var executionDelayJitterUnit time.Duration
 func init() {
 	flag.StringVar(&namespace, "namespace", "", "The namespace of the instance to be listed")
 	flag.StringVar(&healthStatus, "health-status", "HEALTHY", "The health status of the instance to be listed")
+	flag.StringVar(&precondition, "precondition", "AllEcsTasksRunning", "Precondition that needs to be met before running the command. Supported values: AllEcsTasksRunning")
+	flag.DurationVar(&preconditionCheckTimeout, "precondition-check-timeout", 30*time.Second, "The timeout for the precondition check")
 	flag.IntVar(&retryCount, "retry-count", 10, "The number of times to retry the request")
 	flag.BoolVar(&noFail, "no-fail", false, "Do not fail if no instances are found")
 	flag.DurationVar(&executionDelayJitter, "execution-delay-jitter", 0, "The amount of jitter that delays the command execution.")
@@ -105,6 +113,85 @@ func (sd *serviceDiscovery) do(ctx context.Context, service string) ([]entry, er
 	)
 }
 
+type taskMetadataV4 struct {
+	Cluster     string `json:"Cluster"`
+	ServiceName string `json:"ServiceName"`
+	VPCID       string `json:"VPCID"`
+	TaskARN     string `json:"TaskARN"`
+	Family      string `json:"Family"`
+	Revision    string `json:"Revision"`
+}
+
+func fetchContainerMetadata(ctx context.Context) (*taskMetadataV4, error) {
+	uri := os.Getenv("AWS_CONTAINER_METADATA_URI_V4")
+	if uri == "" {
+		return nil, fmt.Errorf("AWS_CONTAINER_METADATA_URI_V4 environment variable is not set")
+	}
+	req, err := http.NewRequest(http.MethodGet, uri+"/task", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build a request: %w", err)
+	}
+	req = req.WithContext(ctx)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch container metadata: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch container metadata: %s", resp.Status)
+	}
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	metadata := new(taskMetadataV4)
+	err = json.Unmarshal(b, metadata)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal container metadata: %w", err)
+	}
+	return metadata, nil
+}
+
+func waitForECSServiceUp(ctx context.Context, cfg *aws.Config, cluster string, service string, pollInterval time.Duration, timeout time.Duration) error {
+	client := ecs.NewFromConfig(*cfg)
+	timeoutAt := time.Now().Add(timeout)
+	for time.Now().Before(timeoutAt) {
+		out, err := client.DescribeServices(ctx, &ecs.DescribeServicesInput{
+			Cluster:  &cluster,
+			Services: []string{service},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to describe ECS service: %w", err)
+		}
+		if len(out.Services) == 0 {
+			return fmt.Errorf("no ECS service found for %s", service)
+		}
+		if out.Services[0].RunningCount == out.Services[0].DesiredCount {
+			return nil // Service is up and running
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
+	return fmt.Errorf("ECS service %s is not up after %s", service, timeout)
+}
+
+func preconditionCheckECSService(ctx context.Context, cfg *aws.Config, pollInterval time.Duration, timeout time.Duration) error {
+	metadata, err := fetchContainerMetadata(ctx)
+	if err != nil {
+		return err
+	}
+	return waitForECSServiceUp(ctx, cfg, metadata.Cluster, metadata.ServiceName, pollInterval, timeout)
+}
+
+var preconditions = map[string]func(context.Context, *aws.Config, time.Duration, time.Duration) error{
+	"allecstasksrunning": func(ctx context.Context, cfg *aws.Config, pollInterval time.Duration, timeout time.Duration) error {
+		return preconditionCheckECSService(ctx, cfg, pollInterval, timeout)
+	},
+}
+
 // disableEndpointPrefix applies the flag that will prevent any
 // operation-specific host prefix from being applied
 type disableEndpointPrefix struct{}
@@ -165,6 +252,14 @@ func doIt(ctx context.Context, logger *slog.Logger) error {
 	}
 	if retryCount < 0 {
 		return fmt.Errorf("retry count must be greater than or equal to 0")
+	}
+	var preconditionFunc func(context.Context, *aws.Config, time.Duration, time.Duration) error
+	if precondition != "" {
+		var ok bool
+		preconditionFunc, ok = preconditions[strings.ToLower(precondition)]
+		if !ok {
+			return fmt.Errorf("invalid precondition: %s", precondition)
+		}
 	}
 	hsf := servicediscovery_types.HealthStatusFilter(healthStatus)
 	i := slices.Index[[]servicediscovery_types.HealthStatusFilter](
@@ -380,6 +475,11 @@ func doIt(ctx context.Context, logger *slog.Logger) error {
 			return fmt.Errorf("failed to parse command line: %w", err)
 		}
 		cmdLineT[i] = t
+	}
+
+	if preconditionFunc != nil {
+		logger.Info("checking precondition", slog.String("precondition", precondition))
+		preconditionFunc(ctx, &cfg, 3*time.Second, preconditionCheckTimeout)
 	}
 
 	delay := executionDelayJitterUnit * time.Duration(
